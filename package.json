@@ -1,0 +1,27 @@
+{
+  "name": "duplex-codex",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "A terminal-native dual-agent orchestrator for Codex-style workflows.",
+  "bin": {
+    "duplex-codex": "bin/duplex-codex.js",
+    "duplex-msg": "bin/duplex-msg.js"
+  },
+  "scripts": {
+    "cli": "node bin/duplex-codex.js",
+    "msg": "node bin/duplex-msg.js",
+    "start": "node --experimental-strip-types src/app/bootstrap.ts",
+    "dev": "node --watch --experimental-strip-types src/app/bootstrap.ts",
+    "test": "node --test --test-isolation=none --experimental-strip-types test/cli.test.ts test/msg-cli.test.ts test/broker.test.ts test/coordinator.test.ts test/codex-cli-provider.test.ts test/agent-session.test.ts test/terminal-ui.test.ts test/verification.test.ts",
+    "verify:long": "node --experimental-strip-types src/app/verifyLongRun.ts",
+    "verify:matrix": "node --experimental-strip-types src/app/verifyMatrix.ts"
+  },
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "dependencies": {
+    "@xterm/headless": "^6.0.0",
+    "node-pty": "^1.1.0"
+  }
+}

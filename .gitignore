@@ -1,0 +1,9 @@
+node_modules/
+.duplex/
+
+# Legacy local scripts kept outside this project scope.
+/codex-auto-continue.ps1
+/codex-auto-continue.cmd
+/codex-auto-stop-button.ps1
+/.codex-auto-continue.state.json
+
