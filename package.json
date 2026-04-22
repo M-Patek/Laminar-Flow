@@ -6,6 +6,15 @@
   "description": "A terminal-native dual-agent orchestrator for Codex-style workflows.",
   "bin": {
     "duplex-codex": "bin/duplex-codex.js",
+    "duplex-codex-codex": "bin/duplex-codex-codex.js",
+    "duplex-codex-gemini": "bin/duplex-codex-gemini.js",
+    "duplex-codex-claude": "bin/duplex-codex-claude.js",
+    "duplex-gemini-codex": "bin/duplex-gemini-codex.js",
+    "duplex-gemini-gemini": "bin/duplex-gemini-gemini.js",
+    "duplex-gemini-claude": "bin/duplex-gemini-claude.js",
+    "duplex-claude-codex": "bin/duplex-claude-codex.js",
+    "duplex-claude-gemini": "bin/duplex-claude-gemini.js",
+    "duplex-claude-claude": "bin/duplex-claude-claude.js",
     "duplex-msg": "bin/duplex-msg.js"
   },
   "scripts": {

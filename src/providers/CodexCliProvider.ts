@@ -1,65 +1,28 @@
-import { mkdir, readFile, rm } from "node:fs/promises";
 import path from "node:path";
-import { spawn } from "node:child_process";
-import type { AgentProvider, ProviderInput, ProviderResult, ProviderSessionInfo } from "./Provider.ts";
-import { CodexSessionStateStore, type CodexSessionState } from "./CodexSessionState.ts";
+import { getBackendDescriptor, resolveBackendCommand } from "../backends/backendDescriptors.ts";
+import { CliBackedProvider } from "./CliBackedProvider.ts";
+import { runCliProcess } from "./cliProcess.ts";
+import type { ProviderInput, ProviderResult } from "./Provider.ts";
 
-export class CodexCliProvider implements AgentProvider {
-  readonly name = "codex";
-  private readonly workspaceDir: string;
-  private readonly runtimeDir: string;
-  private readonly sessionStateStore: CodexSessionStateStore;
-  private sessionStatePromise: Promise<CodexSessionState> | null = null;
-
+export class CodexCliProvider extends CliBackedProvider {
   constructor(workspaceDir: string, runtimeDir: string) {
-    this.workspaceDir = workspaceDir;
-    this.runtimeDir = runtimeDir;
-    this.sessionStateStore = new CodexSessionStateStore(runtimeDir);
+    const descriptor = getBackendDescriptor("codex");
+    super({
+      name: descriptor.id,
+      workspaceDir,
+      runtimeDir,
+      supportsSessionResume: descriptor.supportsSessionResume,
+      sessionStoreFileName: descriptor.providerSessionStoreFileName
+    });
   }
 
-  async send(input: ProviderInput): Promise<ProviderResult> {
-    await mkdir(this.runtimeDir, { recursive: true });
-    const sessionState = await this.loadSessionState();
-    const result = await this.runCodex(input, sessionState.agents[input.agentId]?.sessionId);
-
-    if (result.exitCode !== 0 && sessionState.agents[input.agentId]) {
-      delete sessionState.agents[input.agentId];
-      await this.sessionStateStore.save(sessionState);
-      const retried = await this.runCodex(input, undefined);
-      await this.persistSessionRef(input.agentId, sessionState, retried.sessionId);
-      return retried;
-    }
-
-    await this.persistSessionRef(input.agentId, sessionState, result.sessionId);
-    return result;
+  protected execute(input: ProviderInput, sessionId: string | undefined): Promise<ProviderResult> {
+    return this.runCodex(input, sessionId);
   }
 
-  async getSessionInfo(agentId: ProviderInput["agentId"]): Promise<ProviderSessionInfo | null> {
-    const sessionState = await this.loadSessionState();
-    const session = sessionState.agents[agentId];
-    if (!session) {
-      return null;
-    }
-
-    return {
-      sessionId: session.sessionId,
-      updatedAt: session.updatedAt
-    };
-  }
-
-  async resetSession(agentId: ProviderInput["agentId"]): Promise<void> {
-    const sessionState = await this.loadSessionState();
-    if (!sessionState.agents[agentId]) {
-      return;
-    }
-
-    delete sessionState.agents[agentId];
-    await this.sessionStateStore.save(sessionState);
-  }
-
-  private async runCodex(input: ProviderInput, sessionId: string | undefined): Promise<ProviderResult> {
+  protected async runCodex(input: ProviderInput, sessionId: string | undefined): Promise<ProviderResult> {
+    const resolved = resolveBackendCommand("codex");
     const outputFile = path.join(this.runtimeDir, `${input.agentId}-last.txt`);
-    await rm(outputFile, { force: true }).catch(() => undefined);
     const args = sessionId
       ? [
           "exec",
@@ -82,75 +45,21 @@ export class CodexCliProvider implements AgentProvider {
           input.prompt
         ];
 
-    const child =
-      process.platform === "win32"
-        ? spawn(process.env.ComSpec ?? "cmd.exe", ["/d", "/s", "/c", "codex.cmd", ...args], {
-            cwd: this.workspaceDir,
-            windowsHide: true,
-            stdio: ["ignore", "pipe", "pipe"]
-          })
-        : spawn("codex", args, {
-            cwd: this.workspaceDir,
-            windowsHide: true,
-            stdio: ["ignore", "pipe", "pipe"]
-          });
-
-    let stdout = "";
-    let stderr = "";
-
-    child.stdout.on("data", (chunk) => {
-      stdout += chunk.toString();
+    const result = await runCliProcess({
+      workspaceDir: this.workspaceDir,
+      command: resolved.command,
+      args,
+      outputFile
     });
-
-    child.stderr.on("data", (chunk) => {
-      stderr += chunk.toString();
-    });
-
-    const exitCode = await new Promise<number>((resolve, reject) => {
-      child.on("error", reject);
-      child.on("close", (code) => resolve(code ?? 1));
-    });
-
-    let output = "";
-    try {
-      output = (await readFile(outputFile, "utf8")).trim();
-    } catch {
-      output = stdout.trim();
-    }
-
-    const parsedSessionId = parseSessionId(`${stdout}\n${stderr}`) ?? sessionId;
+    const parsedSessionId = parseSessionId(`${result.stdout}\n${result.stderr}`) ?? sessionId;
 
     return {
-      output,
-      exitCode,
+      output: result.output,
+      exitCode: result.exitCode,
       sessionId: parsedSessionId,
-      rawStdout: stdout.trim(),
-      rawStderr: stderr.trim()
+      rawStdout: result.stdout,
+      rawStderr: result.stderr
     };
-  }
-
-  private async loadSessionState(): Promise<CodexSessionState> {
-    if (!this.sessionStatePromise) {
-      this.sessionStatePromise = this.sessionStateStore.load();
-    }
-
-    return this.sessionStatePromise;
-  }
-
-  private async persistSessionRef(
-    agentId: ProviderInput["agentId"],
-    sessionState: CodexSessionState,
-    sessionId: string | undefined
-  ): Promise<void> {
-    if (!sessionId) {
-      return;
-    }
-
-    sessionState.agents[agentId] = {
-      sessionId,
-      updatedAt: new Date().toISOString()
-    };
-    await this.sessionStateStore.save(sessionState);
   }
 }
 

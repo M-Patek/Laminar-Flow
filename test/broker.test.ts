@@ -13,7 +13,7 @@ import {
 import { createConfiguredBrokerClient } from "../src/app/brokerClient.ts";
 import { createDaemonBrokerTransport, resolveBrokerTransportMode } from "../src/app/brokerTransport.ts";
 
-test("broker delays delivery when target peer is busy", async () => {
+test("broker candidate selection is not blocked by peer busy state", async () => {
   const workspace = await mkdtemp(path.join(os.tmpdir(), "duplex-broker-"));
   await upsertPeerState(workspace, { id: "left", status: "busy" });
   await createMessage(workspace, {
@@ -25,61 +25,12 @@ test("broker delays delivery when target peer is busy", async () => {
   });
 
   const candidate = await getNextDeliveryCandidate(workspace, { cooldownMs: 0, lastDeliveryAt: 0 });
-  assert.equal(candidate, undefined);
-});
-
-test("broker treats a stale busy peer as deliverable after the quiet window", async () => {
-  const workspace = await mkdtemp(path.join(os.tmpdir(), "duplex-broker-"));
-  await upsertPeerState(workspace, {
-    id: "left",
-    status: "busy",
-    lastActivityAt: new Date(Date.now() - 5_000).toISOString()
-  });
-  await createMessage(workspace, {
-    from: "right",
-    to: "left",
-    kind: "note",
-    summary: "support finished review",
-    ask: "pick up the review notes"
-  });
-
-  const candidate = await getNextDeliveryCandidate(workspace, { cooldownMs: 0, lastDeliveryAt: 0 });
   assert.ok(candidate);
   assert.equal(candidate?.target, "left");
-  assert.equal(candidate?.merged, false);
+  assert.equal(candidate?.message.from, "right");
 });
 
-test("broker merges concurrent lead/support messages toward left lead", async () => {
-  const workspace = await mkdtemp(path.join(os.tmpdir(), "duplex-broker-"));
-  await upsertPeerState(workspace, { id: "left", status: "idle" });
-  await upsertPeerState(workspace, { id: "right", status: "idle" });
-
-  await createMessage(workspace, {
-    from: "right",
-    to: "left",
-    kind: "note",
-    summary: "support found a regression risk",
-    ask: "review the parser edge case",
-    refs: ["src/parser.ts"]
-  });
-  await createMessage(workspace, {
-    from: "left",
-    to: "right",
-    kind: "handoff",
-    summary: "lead wants test verification",
-    ask: "run parser tests",
-    refs: ["test/parser.test.ts"]
-  });
-
-  const candidate = await getNextDeliveryCandidate(workspace, { cooldownMs: 0, lastDeliveryAt: 0 });
-  assert.ok(candidate);
-  assert.equal(candidate?.target, "left");
-  assert.equal(candidate?.merged, true);
-  assert.equal(candidate?.message.from, "merge");
-  assert.match(candidate?.message.ask ?? "", /support found a regression risk/);
-});
-
-test("broker diagnostics reports blocked reason and next target", async () => {
+test("broker diagnostics reports quiet windows, cooldown, and next target", async () => {
   const workspace = await mkdtemp(path.join(os.tmpdir(), "duplex-broker-"));
   let diagnostics = await getBrokerDiagnostics(workspace, { cooldownMs: 0, lastDeliveryAt: 0 });
   assert.equal(diagnostics.blockedReason, "no_pending");
@@ -95,7 +46,7 @@ test("broker diagnostics reports blocked reason and next target", async () => {
   });
 
   diagnostics = await getBrokerDiagnostics(workspace, { cooldownMs: 0, lastDeliveryAt: 0 });
-  assert.equal(diagnostics.blockedReason, "left_busy");
+  assert.equal(diagnostics.blockedReason, "none");
   assert.ok(diagnostics.quietRemainingMs.left > 0);
 
   await upsertPeerState(workspace, {

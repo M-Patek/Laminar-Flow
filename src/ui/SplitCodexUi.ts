@@ -1,57 +1,45 @@
-import readline from "node:readline";
+﻿import readline from "node:readline";
 import { spawnSync } from "node:child_process";
-import { existsSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import pty from "node-pty";
-import xtermHeadless from "@xterm/headless";
 import {
   createConfiguredBrokerClient
 } from "../app/brokerClient.ts";
-import type { BrokerClient, DuplexMessage } from "../app/brokerClient.ts";
-
-const { Terminal } = xtermHeadless;
+import {
+  type InteractiveBackendId,
+  type InteractiveCliBackend
+} from "../backends/interactiveCliBackend.ts";
+import { InteractiveSessionStateStore, type InteractiveSessionState } from "../backends/InteractiveSessionState.ts";
+import type { BrokerClient } from "../app/brokerClient.ts";
+import { buildPaneLines, fillRenderLines, formatPaneLine, padPlain, type RenderLine } from "./render/PaneRenderer.ts";
+import { DuplexRuntime, type PaneHandle, type PaneId, type PaneRole } from "../runtime/DuplexRuntime.ts";
 
 type FocusTarget = "left" | "right" | "control";
-type PaneId = "left" | "right";
-type PaneStatus = "starting" | "running" | "exited";
-type PaneRole = "lead" | "support";
 type MouseMode = "ui" | "select";
 
 interface SplitCodexUiOptions {
   workspaceDir: string;
   maxTurns?: number;
-  leftPrompt?: string;
-  rightPrompt?: string;
+  newSession?: boolean;
+  interactiveBackend?: InteractiveBackendId;
+  leftInteractiveBackend?: InteractiveBackendId;
+  rightInteractiveBackend?: InteractiveBackendId;
   onExit?: () => Promise<void>;
-}
-
-interface PaneHandle {
-  id: PaneId;
-  role: PaneRole;
-  terminal: Terminal;
-  pty: pty.IPty;
-  status: PaneStatus;
-  exitCode?: number;
-  writeQueue: Promise<void>;
-}
-
-interface RenderLine {
-  text: string;
-  cursorCol?: number;
 }
 
 export class SplitCodexUi {
   private readonly workspaceDir: string;
   private readonly onExit?: () => Promise<void>;
   private readonly broker: BrokerClient;
-  private readonly initialPrompts: Partial<Record<PaneId, string>>;
+  private readonly newSession: boolean;
+  private readonly defaultInteractiveBackendId?: InteractiveBackendId;
+  private readonly explicitPaneBackendIds: Partial<Record<PaneId, InteractiveBackendId>>;
+  private readonly sessionStateStore: InteractiveSessionStateStore;
   private readonly closed: Promise<void>;
   private closeResolver!: () => void;
   private readonly panes = new Map<PaneId, PaneHandle>();
-  private readonly codexCommand = process.platform === "win32" ? resolveWindowsCodexCommand() ?? "codex.cmd" : "codex";
-  private readonly codexBinDir = process.platform === "win32" ? resolveWindowsCodexBinDir() : undefined;
   private readonly toolBinDir = resolveToolBinDir();
+  private readonly paneBackends = new Map<PaneId, InteractiveCliBackend>();
   private readonly paneRoles: Record<PaneId, PaneRole> = {
     left: "lead",
     right: "support"
@@ -60,19 +48,28 @@ export class SplitCodexUi {
     left: 0,
     right: 0
   };
+  private readonly pinnedViewportStart: Partial<Record<PaneId, number>> = {};
   private focus: FocusTarget = "left";
   private lastPaneFocus: PaneId = "left";
   private commandBuffer = "";
-  private notice = "Click switch panes | Right-click paste | Tab select text | F1 control | Wheel/PgUp/PgDn scroll";
+  private controlNotice = "";
+  private notice = "Click switch panes | Right-click/Ctrl+V paste | Tab select text | F1 control | Wheel/PgUp/PgDn scroll";
   private renderQueued = false;
   private stopped = false;
   private lastFrame = "";
   private suppressMouseKeypressUntil = 0;
   private mailboxTimer?: NodeJS.Timeout;
   private readonly mailboxDeliveryInFlight = new Set<string>();
-  private readonly initialPromptInjected = new Set<PaneId>();
+  private readonly paneSessionDiscoveryInFlight = new Set<PaneId>();
+  private readonly paneSessionDiscoveryQueue: Partial<Record<InteractiveBackendId, Promise<void>>> = {};
+  private readonly paneSessionIds: Partial<Record<PaneId, string>> = {};
+  private readonly paneSessionBaselines: Partial<Record<PaneId, string[]>> = {};
+  private interactiveSessionState: InteractiveSessionState = { panes: {} };
+  private readonly runtime: DuplexRuntime;
   private recentMailboxDeliveryAt = 0;
   private readonly idleTimers: Partial<Record<PaneId, NodeJS.Timeout>> = {};
+  private readonly recentPaneActivityAt: Record<PaneId, number> = { left: 0, right: 0 };
+  private readonly recentUserInputAt: Record<PaneId, number> = { left: 0, right: 0 };
   private maxTurns = 8;
   private deliveredTurns = 0;
   private mailboxCache = {
@@ -82,24 +79,87 @@ export class SplitCodexUi {
   };
   private brokerHint = "broker:pending none";
   private mouseMode: MouseMode = "ui";
+  private deliveryPaused = true;
 
   constructor(options: SplitCodexUiOptions) {
     this.workspaceDir = options.workspaceDir;
     this.onExit = options.onExit;
     this.broker = createConfiguredBrokerClient(this.workspaceDir);
-    this.initialPrompts = {
-      left: options.leftPrompt,
-      right: options.rightPrompt
+    this.newSession = options.newSession ?? false;
+    this.defaultInteractiveBackendId = options.interactiveBackend;
+    this.explicitPaneBackendIds = {
+      left: options.leftInteractiveBackend,
+      right: options.rightInteractiveBackend
     };
+    this.sessionStateStore = new InteractiveSessionStateStore(this.workspaceDir);
     if (options.maxTurns !== undefined) {
       this.maxTurns = options.maxTurns;
     }
+    this.deliveryPaused = !this.newSession;
+    this.runtime = new DuplexRuntime({
+      workspaceDir: this.workspaceDir,
+      newSession: this.newSession,
+      toolBinDir: this.toolBinDir,
+      broker: this.broker,
+      defaultInteractiveBackendId: this.defaultInteractiveBackendId,
+      explicitPaneBackendIds: this.explicitPaneBackendIds,
+      paneRoles: this.paneRoles,
+      state: {
+        panes: this.panes,
+        paneBackends: this.paneBackends,
+        mailboxDeliveryInFlight: this.mailboxDeliveryInFlight,
+        idleTimers: this.idleTimers,
+        paneSessionDiscoveryInFlight: this.paneSessionDiscoveryInFlight,
+        paneSessionDiscoveryQueue: this.paneSessionDiscoveryQueue,
+        paneSessionIds: this.paneSessionIds,
+        paneSessionBaselines: this.paneSessionBaselines,
+        recentPaneActivityAt: this.recentPaneActivityAt,
+        recentUserInputAt: this.recentUserInputAt
+      },
+      callbacks: {
+        getInteractiveSessionState: () => this.interactiveSessionState,
+        setInteractiveSessionState: (state) => {
+          this.interactiveSessionState = state;
+        },
+        saveInteractiveSessionState: (state) => this.sessionStateStore.save(state),
+        getDeliveryPaused: () => this.deliveryPaused,
+        setDeliveryPaused: (value) => {
+          this.deliveryPaused = value;
+        },
+        getDeliveredTurns: () => this.deliveredTurns,
+        setDeliveredTurns: (value) => {
+          this.deliveredTurns = value;
+        },
+        getMaxTurns: () => this.maxTurns,
+        getRecentMailboxDeliveryAt: () => this.recentMailboxDeliveryAt,
+        setRecentMailboxDeliveryAt: (value) => {
+          this.recentMailboxDeliveryAt = value;
+        },
+        setMailboxCache: (value) => {
+          this.mailboxCache = value;
+        },
+        getMailboxCache: () => this.mailboxCache,
+        setBrokerHint: (value) => {
+          this.brokerHint = value;
+        },
+        getLatestLineIndex: (id) => this.getLatestLineIndex(id),
+        preserveScrolledViewport: (id, previousLatestLine) => this.preserveScrolledViewport(id, previousLatestLine),
+        queueRender: () => this.queueRender(),
+        renderNow: () => this.safeRender(),
+        reportError: (scope, error) => this.reportError(scope, error),
+        setNotice: (message) => {
+          this.notice = message;
+        },
+        getPaneDimensions: () => this.getPaneDimensions()
+      }
+    });
     this.closed = new Promise<void>((resolve) => {
       this.closeResolver = resolve;
     });
   }
 
   async start(): Promise<void> {
+    this.interactiveSessionState = this.newSession ? { panes: {} } : await this.sessionStateStore.load();
     readline.emitKeypressEvents(process.stdin);
     if (process.stdin.isTTY) {
       process.stdin.setRawMode(true);
@@ -111,20 +171,34 @@ export class SplitCodexUi {
     process.stdin.on("data", this.handleRawInput);
     process.stdin.on("keypress", this.handleKeypress);
     process.stdout.on("resize", this.handleResize);
-    await this.broker.resetBrokerState();
+    if (this.newSession) {
+      await this.broker.resetBrokerState();
+      this.deliveryPaused = false;
+      await this.sessionStateStore.save(this.interactiveSessionState);
+    }
     this.mailboxCache = { at: Date.now(), leftUnread: 0, rightUnread: 0 };
     this.deliveredTurns = 0;
-    await this.broker.upsertPeerState({ id: "left", role: this.paneRoles.left, status: "idle" });
-    await this.broker.upsertPeerState({ id: "right", role: this.paneRoles.right, status: "idle" });
+
+    this.notice = this.deliveryPaused
+      ? "Session restored. Delivery is paused; use /resume when you are ready."
+      : "Automatic delivery is live.";
+
+    const { paneCols, paneRows } = this.getPaneDimensions();
+    this.render();
+    await Promise.all([
+      this.startPane("left", paneCols, paneRows),
+      this.startPane("right", paneCols, paneRows)
+    ]);
     this.mailboxTimer = setInterval(() => {
       void this.refreshBrokerCache();
       void this.pollMailboxDeliveries();
     }, 700);
-
-    const { paneCols, paneRows } = this.getPaneDimensions();
-    this.panes.set("left", this.spawnPane("left", paneCols, paneRows));
-    this.panes.set("right", this.spawnPane("right", paneCols, paneRows));
-    this.injectInitialPrompts();
+    void Promise.all([
+      this.broker.upsertPeerState({ id: "left", role: this.paneRoles.left, status: "idle" }),
+      this.broker.upsertPeerState({ id: "right", role: this.paneRoles.right, status: "idle" })
+    ]).catch((error) => {
+      this.reportError("peer-state-init", error);
+    });
     this.render();
   }
 
@@ -160,7 +234,6 @@ export class SplitCodexUi {
 
     await this.broker.upsertPeerState({ id: "left", status: "waiting" });
     await this.broker.upsertPeerState({ id: "right", status: "waiting" });
-    await this.broker.resetBrokerState();
     this.setMouseMode("select");
     process.stdout.write("\u001B[?25h\u001B[0m\u001B[?1049l");
     await this.onExit?.();
@@ -204,11 +277,25 @@ export class SplitCodexUi {
       return;
     }
 
+    if (key.ctrl && key.name === "v") {
+      this.pasteClipboardIntoFocus();
+      return;
+    }
+
+    if (key.name === "tab" && key.shift && this.focus !== "control") {
+      void this.notePeerActivity(this.focus, "busy");
+      this.panes.get(this.focus)?.pty.write("\u001B[Z");
+      return;
+    }
+
     if (key.name === "tab") {
       this.toggleMouseMode();
       return;
     }
 
+    if (this.mouseMode === "select" && this.focus !== "control" && (key.name === "up" || key.name === "down")) {
+      return;
+    }
 
     if (key.name === "f1") {
       if (this.focus === "control") {
@@ -216,7 +303,8 @@ export class SplitCodexUi {
         this.notice = `Returned to ${this.focus}.`;
       } else {
         this.focus = "control";
-        this.notice = "Control focus. /help for commands. Tab returns to the last pane.";
+        this.controlNotice = this.controlNotice || "Control focus. /help shows commands.";
+        this.notice = this.deliveryPaused ? "Control focus. Delivery is paused; use /resume when ready." : "Control focus. /help shows commands.";
       }
       this.safeRender();
       return;
@@ -253,6 +341,7 @@ export class SplitCodexUi {
 
     const sequence = toPtySequence(input, key);
     if (sequence) {
+      this.recentUserInputAt[this.focus] = Date.now();
       void this.notePeerActivity(this.focus, "busy");
       this.panes.get(this.focus)?.pty.write(sequence);
     }
@@ -275,7 +364,7 @@ export class SplitCodexUi {
           continue;
         }
 
-        const step = Math.max(3, Math.floor(this.getScrollStep() / 2));
+        const step = 2;
         if (event.direction === "up") {
           this.adjustPaneOffset(target, step, "older");
         } else {
@@ -365,8 +454,9 @@ export class SplitCodexUi {
 
     switch (name) {
       case "help":
-        this.notice =
-          "/focus left|right | /restart left|right|both | /max-turns <n> | /turns | /status | /quit | left=lead right=support";
+        this.controlNotice =
+          "Commands: /resume | /pause | /clear-mail | /restart left|right|both | /max-turns <n> | /turns | /status | /quit";
+        this.notice = this.controlNotice;
         return;
       case "quit":
         this.notice = "Shutting down.";
@@ -374,154 +464,95 @@ export class SplitCodexUi {
         await this.stop();
         process.exit(0);
         return;
-      case "focus":
-        if (arg === "left" || arg === "right") {
-          this.focus = arg;
-          this.lastPaneFocus = arg;
-          this.notice = `Focused ${arg} pane.`;
-          return;
-        }
-        this.notice = "/focus requires left or right.";
-        return;
+
       case "restart":
         if (arg === "left" || arg === "right") {
           this.restartPane(arg);
-          this.notice = `Restarted ${arg} pane.`;
+          this.controlNotice = `Restarted ${arg} pane.`;
+          this.notice = this.controlNotice;
           return;
         }
         if (arg === "both") {
           this.restartPane("left");
           this.restartPane("right");
-          this.notice = "Restarted both panes.";
+          this.controlNotice = "Restarted both panes.";
+          this.notice = this.controlNotice;
           return;
         }
-        this.notice = "/restart requires left, right, or both.";
+        this.controlNotice = "/restart requires left, right, or both.";
+        this.notice = this.controlNotice;
         return;
       case "status":
-        this.notice = await this.buildRuntimeStatus();
+        this.controlNotice = await this.buildRuntimeStatus();
+        this.notice = this.controlNotice;
+        return;
+      case "resume":
+        this.deliveryPaused = false;
+        this.controlNotice = "Automatic delivery resumed.";
+        this.notice = this.controlNotice;
+        await this.refreshBrokerCache();
+        return;
+      case "pause":
+        this.deliveryPaused = true;
+        this.controlNotice = "Automatic delivery paused. Pane work stays manual until /resume.";
+        this.notice = this.controlNotice;
+        await this.refreshBrokerCache();
+        return;
+      case "clear-mail":
+        await this.broker.resetBrokerState();
+        this.deliveredTurns = 0;
+        this.deliveryPaused = true;
+        this.mailboxCache = { at: Date.now(), leftUnread: 0, rightUnread: 0 };
+        await this.broker.upsertPeerState({ id: "left", role: this.paneRoles.left, status: this.panes.get("left")?.status === "running" ? "idle" : "waiting" });
+        await this.broker.upsertPeerState({ id: "right", role: this.paneRoles.right, status: this.panes.get("right")?.status === "running" ? "idle" : "waiting" });
+        this.controlNotice = "Cleared broker messages for this workspace and paused delivery.";
+        this.notice = this.controlNotice;
+        await this.refreshBrokerCache();
         return;
       case "max-turns": {
-        if (!arg) {
-          this.notice = "/max-turns requires a non-negative integer.";
+        const normalizedArg = normalizeCliInteger(arg);
+        if (!normalizedArg) {
+          this.controlNotice = "/max-turns requires a non-negative integer.";
+          this.notice = this.controlNotice;
           return;
         }
-        const value = Number.parseInt(arg, 10);
+        const value = Number.parseInt(normalizedArg, 10);
         if (!Number.isFinite(value) || value < 0) {
-          this.notice = "/max-turns requires a non-negative integer.";
+          this.controlNotice = "/max-turns requires a non-negative integer.";
+          this.notice = this.controlNotice;
           return;
         }
         this.maxTurns = value;
-        this.notice = value === 0 ? "Turn limit disabled." : `Turn limit set to ${value}.`;
+        this.controlNotice = value === 0 ? "Turn limit disabled." : `Turn limit set to ${value}.`;
+        this.notice = this.controlNotice;
         await this.refreshBrokerCache();
         return;
       }
       case "turns":
-        this.notice = this.buildTurnSummary();
+        this.controlNotice = this.buildTurnSummary();
+        this.notice = this.controlNotice;
         return;
       default:
-        this.notice = `Unknown control command: /${name}`;
+        this.controlNotice = `Unknown control command: /${name}`;
+        this.notice = this.controlNotice;
     }
   }
 
   private restartPane(id: PaneId): void {
-    const oldPane = this.panes.get(id);
-    if (oldPane) {
-      void this.interruptAndKillPane(oldPane);
-    }
-
-    const { paneCols, paneRows } = this.getPaneDimensions();
     this.paneOffsets[id] = 0;
-    this.initialPromptInjected.delete(id);
-    this.panes.set(id, this.spawnPane(id, paneCols, paneRows));
-    this.safeRender();
+    this.runtime.restartPane(id);
   }
 
-  private spawnPane(id: PaneId, cols: number, rows: number): PaneHandle {
-    const shell = this.codexCommand;
-    const args = ["--no-alt-screen"];
-
-    const terminal = new Terminal({
-      cols,
-      rows,
-      scrollback: 5000,
-      allowProposedApi: true
-    });
-
-    const child = pty.spawn(shell, args, {
-      name: "xterm-256color",
-      cols,
-      rows,
-      cwd: this.workspaceDir,
-      env: {
-        ...process.env,
-        TERM: "xterm-256color",
-        PATH: buildPanePath(this.toolBinDir, this.codexBinDir, process.env.PATH)
-      }
-    });
-
-    const pane: PaneHandle = {
-      id,
-      role: this.paneRoles[id],
-      terminal,
-      pty: child,
-      status: "starting",
-      writeQueue: Promise.resolve()
-    };
-
-    child.onData((data) => {
-      pane.status = "running";
-      this.maybeInjectInitialPrompt(id);
-      void this.notePeerActivity(id, "busy");
-      pane.writeQueue = pane.writeQueue
-        .then(
-          () =>
-            new Promise<void>((resolve) => {
-              pane.terminal.write(data, resolve);
-            })
-        )
-        .then(() => {
-          this.queueRender();
-        })
-        .catch((error) => {
-          this.reportError(`pty-write:${id}`, error);
-        });
-    });
-
-    child.onExit(({ exitCode }) => {
-      pane.status = "exited";
-      pane.exitCode = exitCode;
-      void this.notePeerActivity(id, "waiting");
-      this.notice = `${id} exited with code ${exitCode}. Use F1 then /restart ${id}.`;
-      this.safeRender();
-    });
-
-    return pane;
+  private async startPane(id: PaneId, cols: number, rows: number): Promise<void> {
+    await this.runtime.startPane(id, cols, rows);
   }
 
-  private injectInitialPrompts(): void {
-    for (const id of ["left", "right"] as const) {
-      this.maybeInjectInitialPrompt(id);
-    }
+  private resolvePaneBackend(id: PaneId): InteractiveCliBackend {
+    return this.runtime.resolvePaneBackend(id);
   }
 
-  private maybeInjectInitialPrompt(id: PaneId): void {
-    if (this.initialPromptInjected.has(id)) {
-      return;
-    }
-    const prompt = this.initialPrompts[id];
-    const pane = this.panes.get(id);
-    if (!prompt || !pane || pane.status !== "running") {
-      return;
-    }
-
-    this.initialPromptInjected.add(id);
-    setTimeout(() => {
-      if (this.stopped || pane.status === "exited") {
-        return;
-      }
-      void this.notePeerActivity(id, "busy");
-      pane.pty.write(normalizePromptForPty(prompt));
-    }, id === "left" ? 350 : 650);
+  private async capturePaneSessionId(id: PaneId, data: string): Promise<void> {
+    await this.runtime.capturePaneSessionId(id, data);
   }
 
   private queueRender(): void {
@@ -538,30 +569,44 @@ export class SplitCodexUi {
 
   private render(): void {
     const columns = Math.max(process.stdout.columns || 120, 40);
-    const rows = Math.max(process.stdout.rows || 32, 8);
-    const topRows = Math.max(4, rows - 3);
+    const rows = Math.max(process.stdout.rows || 32, 10);
+    const topRows = Math.max(4, rows - 5);
     const leftWidth = Math.floor((columns - 1) / 2);
     const rightWidth = columns - 1 - leftWidth;
-    const leftLines = this.getPaneLines("left", leftWidth, topRows);
-    const rightLines = this.getPaneLines("right", rightWidth, topRows);
-    const status = colorizeStatusLine(padPlain(this.buildStatusLine(), columns), this.focus);
-    const control = colorizeControlLine(padPlain(this.buildControlLine(), columns), this.focus === "control");
+    const statusLines = this.buildStatusLines().map((line) => colorizeStatusLine(padPlain(line, columns), this.focus));
+    const controlLines = this.buildControlLines().map((line, index) =>
+      index === 0
+        ? colorizeControlLine(padPlain(line, columns), this.focus === "control")
+        : colorText(padPlain(line, columns), ANSI.dim)
+    );
     const output: string[] = [];
-    const divider = colorizeDivider("|", this.focus);
+    const selectPane = this.getSelectPaneId();
 
-    for (let row = 0; row < topRows; row += 1) {
-      output.push(
-        `${formatPaneLine(leftLines[row], leftWidth, this.focus === "left" ? ANSI.red : undefined)}${divider}${formatPaneLine(
-          rightLines[row],
-          rightWidth,
-          this.focus === "right" ? ANSI.green : undefined
-        )}`
-      );
+    if (selectPane) {
+      const lines = this.getPaneLines(selectPane, columns, topRows);
+      const color = selectPane === "left" ? ANSI.blue : ANSI.green;
+      for (let row = 0; row < topRows; row += 1) {
+        output.push(formatPaneLine(lines[row], columns, color));
+      }
+    } else {
+      const leftLines = this.getPaneLines("left", leftWidth, topRows);
+      const rightLines = this.getPaneLines("right", rightWidth, topRows);
+      const divider = colorizeDivider("|", this.focus);
+
+      for (let row = 0; row < topRows; row += 1) {
+        output.push(
+          `${formatPaneLine(leftLines[row], leftWidth, this.focus === "left" ? ANSI.blue : undefined)}${divider}${formatPaneLine(
+            rightLines[row],
+            rightWidth,
+            this.focus === "right" ? ANSI.green : undefined
+          )}`
+        );
+      }
     }
 
     output.push(colorText("-".repeat(columns), ANSI.dim));
-    output.push(status);
-    output.push(control);
+    output.push(...statusLines);
+    output.push(...controlLines);
 
     const frame = output.join("\n");
     if (frame === this.lastFrame) {
@@ -592,55 +637,58 @@ export class SplitCodexUi {
 
     try {
       const buffer = pane.terminal.buffer.active;
+      const backend = this.paneBackends.get(id) ?? this.resolvePaneBackend(id);
       const latestLine = this.getLatestLineIndex(id);
       const maxOffset = this.getMaxOffset(id, height);
       const offset = Math.min(this.paneOffsets[id], maxOffset);
-      const start = Math.max(0, latestLine - height + 1 - offset);
-      const lines: RenderLine[] = [];
-      const cursorLine = buffer.baseY + buffer.cursorY;
-      const cursorCol = buffer.cursorX;
-
-      for (let index = 0; index < height; index += 1) {
-        const lineIndex = start + index;
-        const line = buffer.getLine(start + index);
-        lines.push({
-          text: sanitizeLine(line?.translateToString(true) ?? "", width),
-          cursorCol:
-            this.focus === id && lineIndex === cursorLine && this.focus !== "control" ? Math.min(cursorCol, Math.max(0, width - 1)) : undefined
-        });
-      }
-
-      return lines;
+      const start = this.resolvePaneStart(id, height, latestLine, offset);
+      return buildPaneLines({
+        buffer,
+        backend,
+        width,
+        height,
+        start,
+        focusActive: this.focus === id && this.focus !== "control",
+        recentActivityAt: this.recentPaneActivityAt[id] ?? 0
+      });
     } catch (error) {
       this.reportError(`buffer:${id}`, error);
       return fillRenderLines(height, "");
     }
   }
 
-  private buildStatusLine(): string {
+  private buildStatusLines(): string[] {
     const left = this.panes.get("left");
     const right = this.panes.get("right");
+    const leftBackend = this.paneBackends.get("left")?.id ?? this.resolvePaneBackend("left").id;
+    const rightBackend = this.paneBackends.get("right")?.id ?? this.resolvePaneBackend("right").id;
     const mailbox = this.readMailboxUnreadCounts();
     const leftMark = this.focus === "left" ? "LEFT*" : "left ";
     const rightMark = this.focus === "right" ? "RIGHT*" : "right ";
     const controlMark = this.focus === "control" ? "CTRL*" : "ctrl ";
 
-    return [
-      `${leftMark}:${left?.role ?? this.paneRoles.left}:${left?.status ?? "starting"}${formatOffset(this.paneOffsets.left)}`,
-      `${rightMark}:${right?.role ?? this.paneRoles.right}:${right?.status ?? "starting"}${formatOffset(this.paneOffsets.right)}`,
+    const primary = [
+      `${leftMark}:${left?.status ?? "starting"}${formatOffset(this.paneOffsets.left)}`,
+      `${rightMark}:${right?.status ?? "starting"}${formatOffset(this.paneOffsets.right)}`,
       `${controlMark}`,
       `turns:${this.formatTurns()}`,
       `mail:L${mailbox.leftUnread}|R${mailbox.rightUnread}`,
+      `delivery:${this.deliveryPaused ? "paused" : "live"}`,
       this.brokerHint,
-      "provider:codex",
+      `backend:L${leftBackend}|R${rightBackend}`
+    ].join(" | ");
+
+    const secondary = [
       `mouse:${this.mouseMode}`,
       "Click:focus",
-      "RightClick:paste",
+      "RightClick/Ctrl+V:paste",
       "Tab:select",
       "F1:control",
       "PgUp/PgDn:scroll",
       "Ctrl+C:quit"
     ].join(" | ");
+
+    return [primary, secondary];
   }
 
   private buildTurnSummary(): string {
@@ -653,6 +701,8 @@ export class SplitCodexUi {
 
   private async buildRuntimeStatus(): Promise<string> {
     try {
+      const leftBackend = this.paneBackends.get("left")?.id ?? this.resolvePaneBackend("left").id;
+      const rightBackend = this.paneBackends.get("right")?.id ?? this.resolvePaneBackend("right").id;
       const [counts, diagnostics] = await Promise.all([
         this.broker.getUnreadCounts(),
         this.broker.getBrokerDiagnostics({
@@ -660,31 +710,26 @@ export class SplitCodexUi {
           lastDeliveryAt: this.recentMailboxDeliveryAt
         })
       ]);
-      const next = diagnostics.nextTarget
-        ? `${diagnostics.nextTarget}${diagnostics.nextMerged ? "+merge" : ""}`
-        : diagnostics.blockedReason;
+      const next = diagnostics.nextTarget ?? diagnostics.blockedReason;
       const wait =
         diagnostics.blockedReason === "cooldown"
           ? `wait:${diagnostics.cooldownRemainingMs}ms`
-          : diagnostics.blockedReason === "left_busy"
-            ? `wait:L${diagnostics.quietRemainingMs.left}ms`
-            : diagnostics.blockedReason === "right_busy"
-              ? `wait:R${diagnostics.quietRemainingMs.right}ms`
-              : "wait:none";
+          : "wait:none";
       const nextInfo = diagnostics.nextMessage
         ? `${next}:${diagnostics.nextMessage.kind}:${diagnostics.nextMessage.from}->${diagnostics.nextMessage.to}`
         : next;
       return [
         `focus:${this.focus}`,
-        `left:${this.panes.get("left")?.status ?? "starting"}/${this.paneRoles.left}`,
-        `right:${this.panes.get("right")?.status ?? "starting"}/${this.paneRoles.right}`,
+        `left:${this.panes.get("left")?.status ?? "starting"}`,
+        `right:${this.panes.get("right")?.status ?? "starting"}`,
         `peer:L${diagnostics.peers.left.status}/R${diagnostics.peers.right.status}`,
         `turns:${this.formatTurns()}`,
         `mail:L${counts.left}|R${counts.right}`,
+        `delivery:${this.deliveryPaused ? "paused" : "live"}`,
         `broker:${formatBlockedReason(diagnostics.blockedReason)}`,
         wait,
         `next:${nextInfo}`,
-        "provider:codex"
+        `backend:L${leftBackend}|R${rightBackend}`
       ].join(" | ");
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -692,19 +737,28 @@ export class SplitCodexUi {
     }
   }
 
-  private buildControlLine(): string {
+  private buildControlLines(): string[] {
     if (this.focus === "control") {
-      return `control> ${this.commandBuffer}`;
+      const tail = this.commandBuffer || this.controlNotice || this.notice;
+      return [
+        `control> ${tail}`,
+        "Enter:run | Esc:clear/return | F1:return"
+      ];
     }
 
-    return `focus:${this.focus} | ${this.notice}`;
+    return [
+      `focus:${this.focus} | ${this.notice}`,
+      this.mouseMode === "select"
+        ? "Select mode: drag to select | PgUp/PgDn/Home/End scroll | Tab:ui | F1:control"
+        : "Click:focus pane | Tab:select text | Shift+Tab:pass through | F1:control"
+    ];
   }
 
   private getPaneDimensions(): { paneCols: number; paneRows: number } {
     const columns = Math.max(process.stdout.columns || 120, 40);
-    const rows = Math.max(process.stdout.rows || 32, 8);
+    const rows = Math.max(process.stdout.rows || 32, 10);
     const paneCols = Math.floor((columns - 1) / 2);
-    const paneRows = Math.max(4, rows - 3);
+    const paneRows = Math.max(4, rows - 5);
     return { paneCols, paneRows };
   }
 
@@ -726,16 +780,67 @@ export class SplitCodexUi {
     return Math.max(1, this.getPaneDimensions().paneRows - 2);
   }
 
+  private preserveScrolledViewport(id: PaneId, previousLatestLine: number): void {
+    const frozenInSelect = this.mouseMode === "select" && this.getSelectPaneId() === id;
+    if (this.paneOffsets[id] <= 0 && !frozenInSelect) {
+      delete this.pinnedViewportStart[id];
+      return;
+    }
+
+    const { paneRows } = this.getPaneDimensions();
+    const latestLine = this.getLatestLineIndex(id);
+    const maxStart = Math.max(0, latestLine - paneRows + 1);
+    const pinned = this.pinnedViewportStart[id];
+    if (pinned === undefined) {
+      this.pinnedViewportStart[id] = Math.max(0, latestLine - paneRows + 1 - this.paneOffsets[id]);
+      return;
+    }
+
+    this.pinnedViewportStart[id] = Math.min(pinned, maxStart);
+  }
+
   private adjustPaneOffset(id: PaneId, delta: number, direction: "older" | "newer"): void {
     const { paneRows } = this.getPaneDimensions();
     const maxOffset = this.getMaxOffset(id, paneRows);
     const next = Math.max(0, Math.min(maxOffset, this.paneOffsets[id] + delta));
     this.paneOffsets[id] = next;
+    if (next === 0) {
+      delete this.pinnedViewportStart[id];
+    } else {
+      const latestLine = this.getLatestLineIndex(id);
+      this.pinnedViewportStart[id] = Math.max(0, latestLine - paneRows + 1 - next);
+    }
     this.notice =
       next === 0
         ? `${id} is at the latest content.`
         : `${id} scrolled ${direction} (${next}/${maxOffset}).`;
     this.safeRender();
+  }
+
+  private resolvePaneStart(id: PaneId, height: number, latestLine: number, offset: number): number {
+    const frozenInSelect = this.mouseMode === "select" && this.getSelectPaneId() === id;
+    if (offset <= 0 && !frozenInSelect) {
+      delete this.pinnedViewportStart[id];
+      return Math.max(0, latestLine - height + 1);
+    }
+
+    const maxStart = Math.max(0, latestLine - height + 1);
+    const pinned = this.pinnedViewportStart[id];
+    if (pinned === undefined) {
+      const start = Math.max(0, latestLine - height + 1 - offset);
+      this.pinnedViewportStart[id] = start;
+      return start;
+    }
+
+    return Math.min(pinned, maxStart);
+  }
+
+  private getSelectPaneId(): PaneId | undefined {
+    if (this.mouseMode !== "select") {
+      return undefined;
+    }
+
+    return this.focus === "control" ? this.lastPaneFocus : this.focus;
   }
 
   private resolvePaneTarget(column: number, row: number): PaneId | undefined {
@@ -787,18 +892,29 @@ export class SplitCodexUi {
       return;
     }
 
+    this.recentUserInputAt[this.focus] = Date.now();
     void this.notePeerActivity(this.focus, "busy");
-    pane.pty.write(normalizeClipboardForPty(text));
+    pane.pty.write("\u001B[200~" + normalizeClipboardForPty(text) + "\u001B[201~");
     this.notice = `Pasted clipboard into ${this.focus} pane.`;
     this.safeRender();
   }
+
   private toggleMouseMode(): void {
     const nextMode: MouseMode = this.mouseMode === "ui" ? "select" : "ui";
+    const selectPane = this.focus === "control" ? this.lastPaneFocus : this.focus;
+    if (nextMode === "select") {
+      const { paneRows } = this.getPaneDimensions();
+      const latestLine = this.getLatestLineIndex(selectPane);
+      this.pinnedViewportStart[selectPane] = Math.max(0, latestLine - paneRows + 1 - this.paneOffsets[selectPane]);
+    } else if (this.paneOffsets[selectPane] <= 0) {
+      delete this.pinnedViewportStart[selectPane];
+    }
+
     this.setMouseMode(nextMode);
     this.notice =
       nextMode === "select"
-        ? "Selection mode enabled. Drag to select text. Press Tab to restore click focus, wheel scroll, and right-click paste."
-        : "UI mouse mode enabled. Click focuses panes, wheel scrolls, and right-click pastes clipboard.";
+        ? `Selection mode enabled for ${selectPane}. Drag to select text. Use PgUp/PgDn/Home/End to scroll this pane. Press Tab to return to UI mode.`
+        : "UI mouse mode enabled. Click focuses panes, wheel scrolls, and right-click or Ctrl+V pastes clipboard.";
     this.safeRender();
   }
 
@@ -830,129 +946,26 @@ export class SplitCodexUi {
   }
 
   private readMailboxUnreadCounts(): { leftUnread: number; rightUnread: number } {
-    return this.mailboxCache;
+    return this.runtime.readMailboxUnreadCounts();
   }
 
   private async refreshBrokerCache(): Promise<void> {
-    try {
-      const counts = await this.broker.getUnreadCounts();
-      const diagnostics = await this.broker.getBrokerDiagnostics({
-        cooldownMs: 1200,
-        lastDeliveryAt: this.recentMailboxDeliveryAt
-      });
-      this.mailboxCache = {
-        at: Date.now(),
-        leftUnread: counts.left,
-        rightUnread: counts.right
-      };
-      this.brokerHint = formatBrokerHint(diagnostics, {
-        maxTurns: this.maxTurns,
-        deliveredTurns: this.deliveredTurns
-      });
-      this.safeRender();
-    } catch (error) {
-      this.reportError("broker-cache", error);
-    }
+    await this.runtime.refreshBrokerCache();
   }
 
   private async notePeerActivity(id: PaneId, status: "busy" | "idle" | "waiting" | "integrating"): Promise<void> {
-    try {
-      const existing = this.idleTimers[id];
-      if (existing) {
-        clearTimeout(existing);
-        delete this.idleTimers[id];
-      }
-
-      await this.broker.upsertPeerState({
-        id,
-        role: this.paneRoles[id],
-        status
-      });
-
-      if (status === "busy" || status === "integrating") {
-        this.idleTimers[id] = setTimeout(() => {
-          delete this.idleTimers[id];
-          void this.broker.upsertPeerState({
-            id,
-            role: this.paneRoles[id],
-            status: "idle"
-          });
-        }, 3200);
-      }
-    } catch {
-      // Ignore peer-state bookkeeping failures in the UI loop.
-    }
+    await this.runtime.notePeerActivity(id, status);
   }
 
   private async pollMailboxDeliveries(): Promise<void> {
     if (this.stopped) {
       return;
     }
-
-    try {
-      if (this.maxTurns > 0 && this.deliveredTurns >= this.maxTurns) {
-        this.notice = `Turn limit reached (${this.deliveredTurns}/${this.maxTurns}).`;
-        await this.refreshBrokerCache();
-        return;
-      }
-
-      const candidate = await this.broker.getNextDeliveryCandidate({
-        cooldownMs: 1200,
-        lastDeliveryAt: this.recentMailboxDeliveryAt
-      });
-      if (!candidate || candidate.message.deliveredAt || this.mailboxDeliveryInFlight.has(candidate.message.id)) {
-        return;
-      }
-
-      const { message, target } = candidate;
-      const pane = this.panes.get(target);
-      if (!pane || pane.status === "exited") {
-        return;
-      }
-
-      this.mailboxDeliveryInFlight.add(message.id);
-      try {
-        await this.notePeerActivity(target, target === "left" ? "integrating" : "busy");
-        await this.typeSubmittedMessageIntoPane(pane, formatInjectedMessage(message, this.paneRoles[target]));
-        if (!message.id.includes("__merge__")) {
-          await this.broker.markMessageDelivered(message.id);
-        }
-        this.recentMailboxDeliveryAt = Date.now();
-        this.deliveredTurns += 1;
-        this.notice = `Delivered ${message.kind} from ${message.from} to ${message.to}.`;
-        await this.refreshBrokerCache();
-        this.safeRender();
-      } finally {
-        this.mailboxDeliveryInFlight.delete(message.id);
-      }
-    } catch (error) {
-      this.reportError("mailbox-delivery", error);
-    }
-  }
-
-  private async typeSubmittedMessageIntoPane(pane: PaneHandle, message: string): Promise<void> {
-    for (const char of message) {
-      pane.pty.write(char);
-      await delay(18);
-    }
-    await delay(120);
-    pane.pty.write("\r");
+    await this.runtime.pollMailboxDeliveries();
   }
 
   private async interruptAndKillPane(pane: PaneHandle): Promise<void> {
-    try {
-      pane.pty.write("\u0003");
-    } catch {
-      // Ignore interruption failures.
-    }
-
-    await delay(80);
-
-    try {
-      pane.pty.kill();
-    } catch {
-      // Ignore child teardown races.
-    }
+    await this.runtime.interruptAndKillPane(pane);
   }
 
   private toPaneId(value: string): PaneId | undefined {
@@ -963,54 +976,8 @@ export class SplitCodexUi {
   }
 }
 
-function resolveWindowsCodexBinDir(): string | undefined {
-  const command = resolveWindowsCodexCommand();
-  if (command) {
-    return path.dirname(command);
-  }
-
-  return undefined;
-}
-
 function resolveToolBinDir(): string {
   return path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../");
-}
-
-function buildPanePath(toolBinDir: string, codexBinDir: string | undefined, existingPath: string | undefined): string {
-  const segments = [toolBinDir];
-  if (codexBinDir) {
-    segments.push(codexBinDir);
-  }
-  if (existingPath) {
-    segments.push(existingPath);
-  }
-  return segments.join(";");
-}
-
-function resolveWindowsCodexCommand(): string | undefined {
-  const whereResult = spawnSync("where.exe", ["codex.cmd"], {
-    encoding: "utf8",
-    windowsHide: true
-  });
-
-  if (whereResult.status === 0) {
-    const first = whereResult.stdout
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .find(Boolean);
-    if (first) {
-      return first;
-    }
-  }
-
-  const userProfile = process.env.USERPROFILE ?? "";
-  const candidates = [
-    path.join(userProfile, "anaconda3", "codex.cmd"),
-    path.join(userProfile, "AppData", "Roaming", "npm", "codex.cmd")
-  ];
-
-  const match = candidates.find((candidate) => existsSync(candidate));
-  return match;
 }
 
 function toPtySequence(input: string, key: readline.Key): string | undefined {
@@ -1057,24 +1024,6 @@ function toPtySequence(input: string, key: readline.Key): string | undefined {
   return undefined;
 }
 
-function sanitizeLine(value: string, width: number): string {
-  return truncateToWidth(stripAnsi(value).replace(/\t/g, "    "), width);
-}
-
-function stripAnsi(value: string): string {
-  return value.replace(/\u001B\[[0-9;?]*[ -/]*[@-~]/g, "");
-}
-
-function padPlain(value: string, width: number): string {
-  const truncated = truncateToWidth(value, width);
-  const visibleWidth = getDisplayWidth(truncated);
-  if (visibleWidth >= width) {
-    return truncated;
-  }
-
-  return `${truncated}${" ".repeat(width - visibleWidth)}`;
-}
-
 const ANSI = {
   reset: "\u001B[0m",
   dim: "\u001B[2m",
@@ -1091,11 +1040,11 @@ const ANSI = {
 
 function colorizeStatusLine(line: string, focus: FocusTarget): string {
   let output = line;
-  output = output.replace("provider:codex", colorText("provider:codex", ANSI.blue));
+  output = output.replace(/backend:[^|]+/g, (value) => colorText(value, ANSI.blue));
   output = output.replace(/mail:L\d+\|R\d+/g, (value) => colorText(value, ANSI.magenta));
   output = output.replace(/broker:[^|]+/g, (value) => colorText(value, ANSI.yellow));
   output = output.replace("Click:focus", colorText("Click:focus", ANSI.cyan));
-  output = output.replace("RightClick:paste", colorText("RightClick:paste", ANSI.cyan));
+  output = output.replace("RightClick/Ctrl+V:paste", colorText("RightClick/Ctrl+V:paste", ANSI.cyan));
   output = output.replace("Tab:select", colorText("Tab:select", ANSI.cyan));
   output = output.replace("F1:control", colorText("F1:control", ANSI.cyan));
   output = output.replace("PgUp/PgDn:scroll", colorText("PgUp/PgDn:scroll", ANSI.cyan));
@@ -1104,7 +1053,7 @@ function colorizeStatusLine(line: string, focus: FocusTarget): string {
   output = output.replace("mouse:select", colorText("mouse:select", ANSI.yellow));
   output = output.replace(
     focus === "left" ? "LEFT*" : "left ",
-    focus === "left" ? colorText("LEFT*", ANSI.reverse + ANSI.red) : colorText("left ", ANSI.brightBlack)
+    focus === "left" ? colorText("LEFT*", ANSI.reverse + ANSI.blue) : colorText("left ", ANSI.brightBlack)
   );
   output = output.replace(
     focus === "right" ? "RIGHT*" : "right ",
@@ -1154,79 +1103,24 @@ function colorizeControlLine(line: string, controlFocused: boolean): string {
 }
 
 function colorizeDivider(divider: string, focus: FocusTarget): string {
-  if (focus === "control") {
-    return colorText(divider, ANSI.yellow);
-  }
-  if (focus === "left") {
-    return colorText(divider, ANSI.red);
-  }
-  if (focus === "right") {
-    return colorText(divider, ANSI.green);
-  }
-  return colorText(divider, ANSI.brightCyan);
+  void focus;
+  return colorText(divider, ANSI.brightBlack);
 }
 
 function colorText(text: string, code: string): string {
   return `${code}${text}${ANSI.reset}`;
 }
 
-function formatInjectedMessage(message: DuplexMessage, targetRole: PaneRole): string {
-  const refs = message.refs.length > 0 ? message.refs.join(", ") : "(none)";
-  const singleLine = [
-    `[${message.from}->${message.to}][${message.kind}][target:${targetRole}]`,
-    `summary: ${message.summary}`,
-    `ask: ${message.ask}`,
-    `refs: ${refs}`
-  ].join(" | ");
-  return `${singleLine}\r`;
-}
-
-function normalizePromptForPty(prompt: string): string {
-  const trimmed = prompt.replace(/\s+$/u, "");
-  return `${trimmed.replace(/\r?\n/g, "\r")}\r`;
-}
-
 function normalizeClipboardForPty(text: string): string {
   return text.replace(/\r?\n/g, "\r");
 }
 
-function formatBrokerHint(diagnostics: {
-  peers: Record<PaneId, { status: string }>;
-  pending: Record<PaneId, number>;
-  blockedReason: string;
-  cooldownRemainingMs: number;
-  quietRemainingMs: Record<PaneId, number>;
-  nextTarget?: PaneId;
-  nextMerged: boolean;
-}, turns: {
-  maxTurns: number;
-  deliveredTurns: number;
-}): string {
-  if (turns.maxTurns > 0 && turns.deliveredTurns >= turns.maxTurns) {
-    return `broker:L${diagnostics.peers.left.status}/R${diagnostics.peers.right.status} qL${diagnostics.pending.left} qR${diagnostics.pending.right} next:turn_limit`;
-  }
-  const next = diagnostics.nextTarget
-    ? `${diagnostics.nextTarget}${diagnostics.nextMerged ? "+merge" : ""}`
-    : diagnostics.blockedReason === "cooldown"
-      ? `cooldown:${diagnostics.cooldownRemainingMs}ms`
-      : diagnostics.blockedReason === "left_busy"
-        ? `left_busy:${diagnostics.quietRemainingMs.left}ms`
-        : diagnostics.blockedReason === "right_busy"
-          ? `right_busy:${diagnostics.quietRemainingMs.right}ms`
-          : diagnostics.blockedReason;
-  return `broker:L${diagnostics.peers.left.status}/R${diagnostics.peers.right.status} qL${diagnostics.pending.left} qR${diagnostics.pending.right} next:${next}`;
-}
-
-function formatBlockedReason(reason: "none" | "cooldown" | "left_busy" | "right_busy" | "no_pending"): string {
+function formatBlockedReason(reason: "none" | "cooldown" | "no_pending"): string {
   switch (reason) {
     case "none":
       return "ready";
     case "cooldown":
       return "cooldown";
-    case "left_busy":
-      return "left-busy";
-    case "right_busy":
-      return "right-busy";
     case "no_pending":
       return "idle";
     default:
@@ -1234,55 +1128,8 @@ function formatBlockedReason(reason: "none" | "cooldown" | "left_busy" | "right_
   }
 }
 
-function fillRenderLines(count: number, value: string): RenderLine[] {
-  return Array.from({ length: count }, () => ({ text: value }));
-}
-
 function formatOffset(offset: number): string {
   return offset > 0 ? `@-${offset}` : "";
-}
-
-function formatPaneLine(line: RenderLine | undefined, width: number, focusColor?: string): string {
-  const padded = padPlain(line?.text ?? "", width);
-  if (line?.cursorCol === undefined || focusColor === undefined) {
-    return padded;
-  }
-
-  return highlightCursorColumn(padded, line.cursorCol, focusColor);
-}
-
-function highlightCursorColumn(value: string, column: number, color: string): string {
-  const safeColumn = Math.max(0, column);
-  let displayWidth = 0;
-  let index = 0;
-
-  while (index < value.length) {
-    const codePoint = value.codePointAt(index);
-    if (codePoint === undefined) {
-      break;
-    }
-    const char = String.fromCodePoint(codePoint);
-    const charWidth = getCharWidth(char);
-    if (displayWidth + charWidth > safeColumn) {
-      break;
-    }
-    displayWidth += charWidth;
-    index += char.length;
-  }
-
-  if (index >= value.length) {
-    return value;
-  }
-
-  const codePoint = value.codePointAt(index);
-  if (codePoint === undefined) {
-    return value;
-  }
-
-  const char = String.fromCodePoint(codePoint);
-  const before = value.slice(0, index);
-  const after = value.slice(index + char.length);
-  return `${before}${ANSI.reverse}${color}${char}${ANSI.reset}${after}`;
 }
 
 function isMouseSequence(value: string | undefined): boolean {
@@ -1364,72 +1211,6 @@ function parseMouseEvents(input: string): Array<{
 }
 
 
-function truncateToWidth(value: string, width: number): string {
-  let result = "";
-  let consumed = 0;
-
-  for (const char of value) {
-    const charWidth = getCharWidth(char);
-    if (consumed + charWidth > width) {
-      break;
-    }
-
-    result += char;
-    consumed += charWidth;
-  }
-
-  return result;
-}
-
-function getDisplayWidth(value: string): number {
-  let width = 0;
-  for (const char of value) {
-    width += getCharWidth(char);
-  }
-
-  return width;
-}
-
-function getCharWidth(char: string): number {
-  const codePoint = char.codePointAt(0) ?? 0;
-
-  if (
-    codePoint === 0 ||
-    codePoint < 32 ||
-    (codePoint >= 0x7f && codePoint < 0xa0) ||
-    (codePoint >= 0x300 && codePoint <= 0x36f)
-  ) {
-    return 0;
-  }
-
-  if (
-    codePoint >= 0x1100 &&
-    (
-      codePoint <= 0x115f ||
-      codePoint === 0x2329 ||
-      codePoint === 0x232a ||
-      (codePoint >= 0x2e80 && codePoint <= 0xa4cf && codePoint !== 0x303f) ||
-      (codePoint >= 0xac00 && codePoint <= 0xd7a3) ||
-      (codePoint >= 0xf900 && codePoint <= 0xfaff) ||
-      (codePoint >= 0xfe10 && codePoint <= 0xfe19) ||
-      (codePoint >= 0xfe30 && codePoint <= 0xfe6f) ||
-      (codePoint >= 0xff00 && codePoint <= 0xff60) ||
-      (codePoint >= 0xffe0 && codePoint <= 0xffe6) ||
-      (codePoint >= 0x1f300 && codePoint <= 0x1f64f) ||
-      (codePoint >= 0x1f900 && codePoint <= 0x1f9ff) ||
-      (codePoint >= 0x20000 && codePoint <= 0x3fffd)
-    )
-  ) {
-    return 2;
-  }
-
-  return 1;
-}
-
-function delay(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
 
 
 
@@ -1456,3 +1237,20 @@ function readClipboardText(): string {
     return "";
   }
 }
+function normalizeCliInteger(value: string): string {
+  return value
+    .trim()
+    .replace(/[<>]/g, "")
+    .replace(/\u3000/g, " ")
+    .replace(/[\uFF10-\uFF19]/g, (digit) => String.fromCharCode(digit.charCodeAt(0) - 0xfee0))
+    .replace(/\s+/g, " ");
+}
+
+
+
+
+
+
+
+
+

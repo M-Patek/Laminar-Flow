@@ -1,149 +1,133 @@
 # Interaction Model
 
-The terminal has three conceptual regions:
+The current interactive UI has three user-facing regions:
 
 - left pane
 - right pane
-- bottom command bar
-- shared event feed between the panes and the command bar
+- bottom status and control area
 
-Every user action maps to one of three primitives:
+This is a terminal wrapper around two real interactive CLI sessions.
+It is not the old coordinator-driven `TerminalUi` model.
 
-- `send`
-- `advance`
-- `handoff`
+## Focus model
 
-## Commands
+Focus can be on:
 
-- `/left <text>`: queue work for the left agent and immediately advance it if possible
-- `/right <text>`: queue work for the right agent and immediately advance it if possible
-- `/both <text>`: queue the same message for both agents
-- `/focus [left|right|next]`: move the local input focus between panes
-- `/input-mode direct|command`: switch between pane draft entry and the shared command buffer
-- `/step left|right`: advance exactly one agent round
-- `/takeover left|right`: mark one agent pane as manually controlled and stop auto-driving it
-- `/release left|right`: remove manual takeover from one agent pane
-- `/retry [left|right]`: retry a blocked or queued agent, or pick the most likely target automatically
-- `/continue`: alias for `/retry`
-- `/reset left|right`: clear one agent's local queue and provider session
-- `/handoff left|right`: create a structured handoff to the opposite agent
-- `/mode manual|step|auto`: switch coordinator mode
-- `/event-filter [all|system|agent|coordinator|message]`: change the bottom event feed scope
-- `/event-open <n>`: inspect the `n`th newest event in the current filter
-- `/event-close`: close the selected event detail panel
-- `/event-next`: move the bottom event feed to an older page
-- `/event-prev`: move the bottom event feed to a newer page
-- `/handoff-details [show|hide]`: expand or collapse the latest handoff detail block
-- `/handoff-open [n]`: inspect the `n`th newest handoff; defaults to `1`
-- `/handoff-close`: close the handoff detail panel
-- `/reports`: refresh the local verification report index and print the newest report files
-- `/report-open [n]`: inspect the `n`th newest verification report; defaults to `1`
-- `/report-close`: close the report detail panel
-- `/max-turns <n>`: set the global turn ceiling for the current workspace; `0` means unlimited
-- `/turns`: show the current turn count and configured ceiling
-- `/pause`: stop automatic advancement
-- `/resume`: resume the coordinator
-- `/resume left|right`: move one agent out of `error` or `needs_human`
-- `/events`: print the latest event feed lines into the notice area
-- `/clear-events`: clear the persisted event feed
-- `/status`: print a compact state summary
-- `/help`: print supported commands
-- `/quit`: persist state and exit
+- `left`
+- `right`
+- `control`
 
-When you type plain text without a command prefix in `direct` mode, it is sent to the currently focused pane. Press `Tab` to move focus between `left` and `right`.
+The focused pane receives keyboard input unless focus is on the control line.
 
-The input model now has two local buffers:
+## Mouse modes
 
-- one draft buffer for each pane in `direct` mode
-- one shared command buffer in `command` mode
+There are two mouse modes:
 
-Switching focus preserves the left and right drafts. Switching input mode preserves whichever buffer is not active.
+- `ui`
+- `select`
 
-Useful keyboard shortcuts:
+### `ui` mode
 
-- `Tab`: switch focus between `left` and `right`
-- `F2`: toggle `direct` and `command` input modes
-- `F3`: open or close the newest event detail in the current filter
-- `F4`: open or close the newest handoff detail
-- `F5` / `F6`: move to older or newer items inside the open event, handoff, or report inspection panel
-- `F7`: open or close the newest loaded verification report
-- `PgUp` / `PgDn`: move to older or newer event-feed pages
-- `Esc`: clear the active input buffer, or close the open inspection panel when the buffer is already empty
+In `ui` mode:
 
-## Failure labels
+- click changes pane focus
+- wheel scroll changes pane viewport
+- right click pastes clipboard into the focused pane
 
-The scheduler now keeps structured failure labels in addition to the human-readable reason text:
+### `select` mode
 
-- agent `issueKind`: `provider_failure`, `interrupted_run`, `no_progress`, or `human_confirmation`
-- coordinator `haltKind`: `turn_limit`, `auto_turn_limit`, `handoff_limit`, `repeated_handoff`, `human_confirmation`, or `no_progress`
+In `select` mode:
 
-These labels appear in status output and the terminal summary so recovery flows can distinguish transport failures from deliberate stop conditions.
+- terminal mouse reporting is disabled
+- the host terminal can drag-select text normally
+- pane scrolling stays available through the keyboard
 
-## Auto mode guardrails
+This is still a host-terminal compromise, not a full pane-local selection engine.
 
-Auto mode can stop itself and enter `halted` when:
+## Keyboard controls
 
-- the handoff count exceeds the configured cap
-- the latest handoff summary is effectively the same as the previous one
-- a handoff draft asks for human confirmation
+- `F1`: enter or leave the control line
+- `Tab`: toggle `ui` and `select` mouse mode
+- `Shift+Tab`: pass through to the focused pane
+- `PgUp` / `PgDn`: scroll the focused pane
+- `Home` / `End`: jump to oldest/latest visible buffered content
+- `Ctrl+V`: paste clipboard into the current focus
+- `Ctrl+C`: quit the whole wrapper
 
-When halted, new user messages are queued but not auto-advanced until `/resume`.
+## Control commands
 
-## Manual takeover
+Enter the control line with `F1`, then use:
 
-When an agent is under manual takeover:
+- `/help`
+- `/resume`
+- `/pause`
+- `/clear-mail`
+- `/restart left`
+- `/restart right`
+- `/restart both`
+- `/max-turns <n>`
+- `/turns`
+- `/status`
+- `/quit`
 
-- user messages still queue for that agent
-- auto mode does not advance that agent
-- auto mode does not continue through a handoff into that agent
-- the user can still use `/step`, `/handoff`, `/resume`, or `/reset` on that side
+Behavior notes:
 
-## UI surfaces
+- `/resume` resumes automatic broker delivery
+- `/pause` stops automatic broker delivery
+- `/clear-mail` clears the local broker state for this workspace and pauses delivery
+- `/max-turns 0` disables the turn cap
+- when the cap is reached, delivery halts but the panes stay alive
 
-The terminal now shows:
+## Delivery model
 
-- left and right agent panes
-- a coordinator summary block with the latest decision and last handoff
-- a shared event feed with filter, paging, and newest-first numbering
-- an optional selected event detail block
-- an optional expanded handoff detail block for the latest or selected handoff
-- an optional verification report detail block for the latest or selected report
-- the bottom input bar, which can operate in `direct` or `command` mode
+The wrapper is manual-first.
 
-The focused pane is marked directly in the pane header and mirrored in the bottom status line. The active direct-input pane also shows its current draft inside the pane body.
+- panes are always real interactive sessions
+- the user can type directly into either pane
+- cross-pane broker delivery is optional
+- restored workspaces start with delivery paused
 
-## Handoff shape
+The control area is there to manage delivery, not to replace direct pane use.
 
-Every handoff is packed into a small structured envelope:
+## Status area
 
-- `Context`: what side is handing off to whom
-- `Result`: the compressed outcome of the latest round
-- `Risk`: the main issue to watch for next
-- `Ask`: the concrete next action expected from the receiving side
+The status area shows:
 
-The coordinator summary mirrors the latest `Risk` and `Ask` so the user can inspect the handoff at a glance before opening the full detail panel.
+- current pane focus
+- pane status: `starting`, `running`, `exited`
+- current turn count and limit
+- unread broker counts
+- delivery state: `paused` or `live`
+- backend selection for left and right panes
+- compact broker diagnostics
+
+Important distinction:
+
+- unread mail counts are not the same thing as pending deliverable messages
+
+## Session behavior
+
+Interactive session state is workspace-local.
+
+- `codex` can auto-resume its interactive session on workspace reopen
+- `gemini` and `claude` start fresh in the wrapper
+- if you want an older Gemini or Claude conversation, resume it inside that native CLI yourself
+
+The wrapper stores pane session metadata, but it does not force all interactive backends into the same resume UX.
+
+## Local messaging
+
+Cross-pane messages are created through `duplex-msg`.
+
+Typical flow:
+
+1. one side sends a broker message
+2. the message lands in local broker storage
+3. automatic delivery is injected into the opposite pane only when delivery is live and timing rules allow it
+
+This means message passing is local, workspace-bound, and best-effort.
 
 ## Headless verification
 
-`npm run verify:long` runs a non-interactive builder-reviewer drill, writes a JSON report under `.duplex/verification/reports`, and prints a JSON summary of:
-
-- verification scenario
-- provider name
-- scenario artifact directory
-- final coordinator status, `haltKind`, and halt reason
-- per-agent status, rounds, and `issueKind`
-- recovery actions that were attempted automatically
-
-Verification scenarios are selected with `DUPLEX_VERIFY_SCENARIO`:
-
-- `default`: use the currently selected provider
-- `no-progress`: force a repeat-output halt
-- `handoff-limit`: drive the loop until the auto-handoff cap is hit
-- `human-confirmation`: stop when review output requests a human checkpoint
-- `provider-recovery`: inject provider failures and verify retries
-
-`npm run verify:matrix` runs the deterministic verification scenarios in one pass, aggregates halt-kind counts, writes a report to `.duplex/verification/reports`, and prints the generated `reportPath`.
-
-Use `/reports` inside the terminal UI to refresh the local report index after a headless verification run. Once loaded, `/report-open 1` or `F7` opens the newest report detail directly in the bottom inspection area.
-
-Set `DUPLEX_PROVIDER=codex` with `DUPLEX_VERIFY_SCENARIO=default` to exercise the real Codex CLI. Use `DUPLEX_PROVIDER=flaky` or `DUPLEX_VERIFY_SCENARIO=provider-recovery` for a local recovery drill.
+Headless verification uses a different interaction model.
+That path belongs to `Coordinator + AgentSession + Provider` and is documented separately in the verification and architecture docs.

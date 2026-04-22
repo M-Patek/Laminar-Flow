@@ -1,6 +1,6 @@
-import crypto from "node:crypto";
+﻿import crypto from "node:crypto";
 import { existsSync } from "node:fs";
-import { copyFile, mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, open, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 export type MsgKind = "handoff" | "question" | "decision" | "blocker" | "note";
@@ -39,21 +39,20 @@ interface BrokerState {
 export interface DeliveryCandidate {
   message: DuplexMessage;
   target: PeerId;
-  merged: boolean;
 }
 
 export interface BrokerDiagnostics {
   peers: Record<PeerId, PeerState>;
   pending: Record<PeerId, number>;
-  blockedReason: "none" | "cooldown" | "left_busy" | "right_busy" | "no_pending";
+  blockedReason: "none" | "cooldown" | "no_pending";
   cooldownRemainingMs: number;
   quietRemainingMs: Record<PeerId, number>;
   nextTarget?: PeerId;
-  nextMerged: boolean;
   nextMessage?: Pick<DuplexMessage, "from" | "to" | "kind" | "summary">;
 }
 
 const QUIET_WINDOW_MS = 3200;
+const BROKER_LOCK_TIMEOUT_MS = 10000;
 const brokerWriteQueues = new Map<string, Promise<void>>();
 
 const DEFAULT_KIND: MsgKind = "note";
@@ -93,6 +92,8 @@ export async function createMessage(
 
     store.messages.unshift(message);
     return message;
+  }, {
+    verify: (store, result) => store.messages.some((message) => message.id === result.id)
   });
 }
 
@@ -168,6 +169,8 @@ export async function upsertPeerState(
     }
 
     return next;
+  }, {
+    verify: (store, result) => store.peers.some((peer) => peer.id === result.id && peer.status === result.status && peer.role === result.role)
   });
 }
 
@@ -203,6 +206,8 @@ export async function resetBrokerState(workspaceDir: string): Promise<void> {
   await mutateBrokerState(workspaceDir, async (store) => {
     store.messages = [];
     store.peers = DEFAULT_PEERS.map((peer) => ({ ...peer }));
+  }, {
+    verify: (store) => store.messages.length === 0
   });
 }
 
@@ -222,36 +227,13 @@ export async function getNextDeliveryCandidate(
     return undefined;
   }
 
-  const leftPeer = store.peers.find((peer) => peer.id === "left") ?? DEFAULT_PEERS[0];
-  const rightPeer = store.peers.find((peer) => peer.id === "right") ?? DEFAULT_PEERS[1];
-  const leftBusy = isPeerBusy(leftPeer, Date.now());
-  const rightBusy = isPeerBusy(rightPeer, Date.now());
-
-  const toLead = pending.filter((message) => message.to === "left");
-  const fromLead = pending.filter((message) => message.from === "left" && message.to === "right");
-  if (toLead.length > 0 && fromLead.length > 0 && !leftBusy) {
-    return {
-      message: buildLeadMergeMessage(fromLead[0]!, toLead[0]!),
-      target: "left",
-      merged: true
-    };
-  }
-
-  if (toLead.length > 0 && !leftBusy) {
-    return {
-      message: toLead[0]!,
-      target: "left",
-      merged: false
-    };
-  }
-
-  const toSupport = pending.filter((message) => message.to === "right");
-  if (toSupport.length > 0 && !rightBusy) {
-    return {
-      message: toSupport[0]!,
-      target: "right",
-      merged: false
-    };
+  for (const message of pending) {
+    if (message.to === "left" || message.to === "right") {
+      return {
+        message,
+        target: message.to
+      };
+    }
   }
 
   return undefined;
@@ -277,8 +259,6 @@ export async function getBrokerDiagnostics(
   const cooldownMs = options?.cooldownMs ?? 1800;
   const lastDeliveryAt = options?.lastDeliveryAt ?? 0;
   const now = Date.now();
-  const leftBusy = isPeerBusy(peers.left, now);
-  const rightBusy = isPeerBusy(peers.right, now);
   const cooldownRemainingMs = Math.max(0, cooldownMs - (now - lastDeliveryAt));
   const cooldownActive = cooldownRemainingMs > 0;
   const quietRemainingMs: Record<PeerId, number> = {
@@ -292,10 +272,6 @@ export async function getBrokerDiagnostics(
     blockedReason = "no_pending";
   } else if (!candidate && cooldownActive) {
     blockedReason = "cooldown";
-  } else if (!candidate && pending.left > 0 && leftBusy) {
-    blockedReason = "left_busy";
-  } else if (!candidate && pending.right > 0 && rightBusy) {
-    blockedReason = "right_busy";
   }
 
   return {
@@ -305,7 +281,6 @@ export async function getBrokerDiagnostics(
     cooldownRemainingMs,
     quietRemainingMs,
     nextTarget: candidate?.target,
-    nextMerged: candidate?.merged ?? false,
     nextMessage: candidate
       ? {
           from: candidate.message.from,
@@ -331,6 +306,8 @@ async function updateMessage(
     const updated = updater(store.messages[index]!);
     store.messages[index] = updated;
     return updated;
+  }, {
+    verify: (store, result) => store.messages.some((message) => message.id === result.id && JSON.stringify(message) === JSON.stringify(result))
   });
 }
 
@@ -452,12 +429,42 @@ function getBrokerStatePath(workspaceDir: string): string {
   return path.join(workspaceDir, ".duplex", "broker", "state.json");
 }
 
-function getLegacyMailboxPath(workspaceDir: string): string {
-  return path.join(workspaceDir, ".duplex", "mailbox", "messages.json");
+function getBrokerLockPath(workspaceDir: string): string {
+  return path.join(workspaceDir, ".duplex", "broker", "state.lock");
 }
 
-function isPeerBusy(peer: PeerState, now: number): boolean {
-  return getPeerQuietRemainingMs(peer, now) > 0;
+async function withBrokerFileLock<T>(workspaceDir: string, action: () => Promise<T>): Promise<T> {
+  const lockPath = getBrokerLockPath(workspaceDir);
+  await mkdir(path.dirname(lockPath), { recursive: true });
+  const deadline = Date.now() + BROKER_LOCK_TIMEOUT_MS;
+
+  while (true) {
+    let handle;
+    try {
+      handle = await open(lockPath, "wx");
+      await handle.writeFile(`${process.pid} ${Date.now()}\n`, "utf8");
+      try {
+        return await action();
+      } finally {
+        await handle.close().catch(() => undefined);
+        await unlink(lockPath).catch(() => undefined);
+      }
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== "EEXIST") {
+        throw error;
+      }
+
+      if (Date.now() >= deadline) {
+        await unlink(lockPath).catch(() => undefined);
+      }
+      await delay(40);
+    }
+  }
+}
+
+function getLegacyMailboxPath(workspaceDir: string): string {
+  return path.join(workspaceDir, ".duplex", "mailbox", "messages.json");
 }
 
 function getPeerQuietRemainingMs(peer: PeerState, now: number): number {
@@ -469,24 +476,6 @@ function getPeerQuietRemainingMs(peer: PeerState, now: number): number {
   }
 
   return 0;
-}
-
-function buildLeadMergeMessage(primary: DuplexMessage, secondary: DuplexMessage): DuplexMessage {
-  return {
-    ...primary,
-    id: `${primary.id}__merge__${secondary.id}`,
-    from: "merge",
-    to: "left",
-    kind: "note",
-    summary: `Primary from ${primary.from}: ${primary.summary}`,
-    ask: `Continue the lead thread first. Also absorb support input: ${secondary.summary}. Secondary ask: ${secondary.ask}`,
-    refs: uniqueRefs([...primary.refs, ...secondary.refs]).slice(0, 4),
-    deliveredAt: undefined
-  };
-}
-
-function uniqueRefs(values: string[]): string[] {
-  return Array.from(new Set(values.filter(Boolean)));
 }
 
 function toMsgKind(value: string | undefined): MsgKind {
@@ -508,7 +497,8 @@ function toMsgStatus(value: string): MsgStatus {
 
 async function mutateBrokerState<T>(
   workspaceDir: string,
-  mutator: (store: BrokerState) => Promise<T> | T
+  mutator: (store: BrokerState) => Promise<T> | T,
+  options?: { verify?: (store: BrokerState, result: T) => boolean }
 ): Promise<T> {
   const key = getBrokerStatePath(workspaceDir);
   const previous = brokerWriteQueues.get(key) ?? Promise.resolve();
@@ -520,10 +510,18 @@ async function mutateBrokerState<T>(
 
   await previous;
   try {
-    const store = await readBrokerState(workspaceDir);
-    const result = await mutator(store);
-    await writeBrokerState(workspaceDir, store);
-    return result;
+    return await withBrokerFileLock(workspaceDir, async () => {
+      const store = await readBrokerState(workspaceDir);
+      const result = await mutator(store);
+      await writeBrokerState(workspaceDir, store);
+      if (options?.verify) {
+        const persisted = await readBrokerState(workspaceDir);
+        if (!options.verify(persisted, result)) {
+          throw new Error("Broker write verification failed.");
+        }
+      }
+      return result;
+    });
   } finally {
     release();
     if (brokerWriteQueues.get(key) === current) {
@@ -564,4 +562,5 @@ async function replaceFileRobust(source: string, destination: string): Promise<v
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
+
 

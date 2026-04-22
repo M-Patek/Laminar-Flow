@@ -1,6 +1,8 @@
-import { readFile } from "node:fs/promises";
+﻿import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { parseInteractiveBackendId, type InteractiveBackendId } from "../backends/interactiveCliBackend.ts";
+import { DUPLEX_COMBO_LAUNCHERS } from "./launchNames.ts";
 import { runLongRunVerification, runVerificationMatrix, writeVerificationReport } from "./verification.ts";
 
 export type CliAction = "start" | "verify:long" | "verify:matrix" | "help" | "version";
@@ -8,8 +10,10 @@ export type CliAction = "start" | "verify:long" | "verify:matrix" | "help" | "ve
 export interface StartCliOptions {
   workspaceDir?: string;
   maxTurns?: number;
-  leftPromptPath?: string;
-  rightPromptPath?: string;
+  newSession?: boolean;
+  interactiveBackend?: InteractiveBackendId;
+  leftInteractiveBackend?: InteractiveBackendId;
+  rightInteractiveBackend?: InteractiveBackendId;
 }
 
 export function resolveCliAction(argv: string[]): CliAction {
@@ -77,16 +81,21 @@ export function buildHelpText(): string {
     "Usage:",
     "  duplex-codex",
     "  duplex-codex start",
+    "  duplex-codex --workspace C:\\path\\to\\repo --max-turns 6",
+    "  duplex-codex --workspace C:\\path\\to\\repo --new",
+    "  duplex-codex --backend gemini",
+    "  duplex-codex --left-backend codex --right-backend claude",
+    `  ${DUPLEX_COMBO_LAUNCHERS[2]}`,
     "  duplex-codex verify:long",
     "  duplex-codex verify:matrix",
-    "  duplex-codex --workspace C:\\path\\to\\repo --max-turns 6 --left-prompt ROLEPROMPT-LEFT-LEAD.md --right-prompt ROLEPROMPT-RIGHT-SUPPORT.md",
     "  duplex-msg send --from left --to right --summary \"review parser\"",
     "  duplex-codex help",
     "  duplex-codex version",
     "",
     "Env:",
     "  DUPLEX_BROKER_TRANSPORT=local|daemon",
-    "  DUPLEX_PROVIDER=mock|codex|flaky",
+    "  DUPLEX_INTERACTIVE_BACKEND=codex|gemini|claude",
+    "  DUPLEX_PROVIDER=mock|codex|gemini|claude|flaky",
     "  DUPLEX_VERIFY_SCENARIO=default|no-progress|handoff-limit|human-confirmation|provider-recovery",
     "  DUPLEX_VERIFY_INCLUDE_DEFAULT=1"
   ].join("\n");
@@ -122,22 +131,39 @@ export function parseStartCliOptions(argv: string[], cwd = process.cwd()): Start
       continue;
     }
 
-    if (token === "--left-prompt") {
+    if (token === "--new") {
+      options.newSession = true;
+      continue;
+    }
+
+    if (token === "--backend") {
       const value = args[index + 1];
       if (!value) {
-        throw new Error("Missing value for --left-prompt");
+        throw new Error("Missing value for --backend");
       }
-      options.leftPromptPath = path.resolve(cwd, value);
+      const parsed = parseInteractiveBackendId(value.trim().toLowerCase());
+      if (!parsed) {
+        throw new Error("--backend must be one of codex, gemini, or claude");
+      }
+      options.interactiveBackend = parsed;
       index += 1;
       continue;
     }
 
-    if (token === "--right-prompt") {
+    if (token === "--left-backend" || token === "--right-backend") {
       const value = args[index + 1];
       if (!value) {
-        throw new Error("Missing value for --right-prompt");
+        throw new Error(`Missing value for ${token}`);
       }
-      options.rightPromptPath = path.resolve(cwd, value);
+      const parsed = parseInteractiveBackendId(value.trim().toLowerCase());
+      if (!parsed) {
+        throw new Error(`${token} must be one of codex, gemini, or claude`);
+      }
+      if (token === "--left-backend") {
+        options.leftInteractiveBackend = parsed;
+      } else {
+        options.rightInteractiveBackend = parsed;
+      }
       index += 1;
       continue;
     }
@@ -172,3 +198,4 @@ if (import.meta.url === invokedUrl) {
     process.exit(1);
   }
 }
+
